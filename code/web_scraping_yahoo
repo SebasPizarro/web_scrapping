@@ -1,0 +1,259 @@
+#Instalamos selenium y otras librerias (solo es necesario una vez):
+!pip install -q selenium webdriver-manager pandas beautifulsoup4 lxml yfinance
+
+#Importamos librerias:
+
+import warnings
+warnings.filterwarnings("ignore") #No tener que ver las advertencias
+
+import re
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+from bs4 import BeautifulSoup
+
+# Selenium para scraping
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+URL_GAINERS = "https://finance.yahoo.com/markets/stocks/gainers"
+
+
+#PARTE 1
+
+
+#Abrimos un navegador en google chrome controlado por un código: Nos conectamos a Yahoo y leemos su contenido
+def crear_driver(headless: bool = True): #headless=true para que no emerga una ventana
+    chrome_options = Options()
+    if headless: #Configuración para la pagina (mejor acceso y uso):
+        chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--lang=en-US")
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=chrome_options)
+
+#Recibe el HTML de la página y extraeemos las filas de "Top Gainers". Se devuelve un diccionario.
+def leer_filas_tabla(html: str): #Buscamos en el HTML la etiqueta <tr>
+    soup = BeautifulSoup(html, "lxml")
+    filas = soup.select('tr[data-testid="data-table-v2-row"]')
+    salida = []
+    for tr in filas:
+        td_sym = tr.select_one('td[data-testid-cell="ticker"]')
+        td_name = tr.select_one('td[data-testid-cell="companyshortname.raw"]')
+        if td_sym and td_name:
+            symbol = td_sym.get_text(strip=True).split()[:1]
+            symbol = symbol[0] if symbol else None
+            name = td_name.get_text(strip=True)
+            if symbol and name:
+                salida.append({"Symbol": symbol, "Name": name})
+    return salida
+
+#Contamos cuantos "Top Gainers" tiene la pagina actualmente, ya que el número de acciones se actualiza constantemente.
+def contar_total(html: str):
+    """Lee el '1–25 of N' si está presente y devuelve N (o None si no aparece)."""
+    soup = BeautifulSoup(html, "lxml")
+    total_div = soup.select_one('div.total')
+    if not total_div:
+        return None
+    txt = total_div.get_text(" ", strip=True)
+    m = re.search(r'of\s+(\d+)', txt)
+    return int(m.group(1)) if m else None
+
+#Recorremos todas las paginas encontradas para sacar la información de cada acción. Se devuelve un DF con todos las acciones encontradas.
+def scrapear_gainers(headless=True, max_pages=50, pausa=1.0):
+    driver = crear_driver(headless=headless)
+    try:
+        driver.get(URL_GAINERS)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table')))
+
+        acumulado = []
+        vistos = set()
+        paginas = 0
+        total_esperado = None
+
+        while True:
+            paginas += 1
+            html = driver.page_source
+
+            if total_esperado is None:
+                total_esperado = contar_total(html)
+
+            filas = leer_filas_tabla(html)
+            for r in filas:
+                key = (r["Symbol"], r["Name"])
+                if key not in vistos:
+                    vistos.add(key)
+                    acumulado.append(r)
+
+            # Buscamos el botón "Siguiente"
+            try:
+                next_btn = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'button[data-testid="next-page-button"]'))
+                )
+            except Exception:
+                break
+
+            if next_btn.get_attribute("disabled") is not None:
+                break
+
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", next_btn)
+            time.sleep(0.2)
+            next_btn.click()
+            time.sleep(pausa)
+
+            if paginas >= max_pages:
+                break
+            if total_esperado is not None and len(acumulado) >= total_esperado:
+                break
+
+        df = pd.DataFrame(acumulado).drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+        return df
+    finally:
+        driver.quit()
+
+gainers_df = scrapear_gainers(headless=True)
+print("Total de gainers obtenidos:", len(gainers_df))
+display(gainers_df.head(15))
+
+# Guardar con un nombre consistente
+gainers_df.to_csv("gainers_symbols.csv", index=False)
+print("Guardado:", "gainers_symbols.csv")
+
+
+# PARTE 2
+
+#Corregimos los ticker especiales con el objetivo que la libreria yfinance reconosca el formato.
+def normalizar_ticker(sym: str):
+    m = re.match(r"^([A-Z0-9]+)\.([A-Z])$", sym)
+    return f"{m.group(1)}-{m.group(2)}" if m else sym
+
+#Leemos el archivo de la parte 1 y aplicamos la función anterior para limpiar la base:
+def cargar_simbolos(csv_path="gainers_symbols.csv"):
+    df = pd.read_csv(csv_path)
+    df["Symbol"] = (
+        df["Symbol"].astype(str).str.upper().str.strip()
+        .str.replace(r"[^A-Z0-9\.\-\^]", "", regex=True)
+        .apply(normalizar_ticker))
+    df = df[df["Symbol"].ne("")].drop_duplicates(subset=["Symbol"]).reset_index(drop=True)
+    return df
+
+#Gracias a la libreria yfinance descargamos los precios diarios de cada acción (simbolo) y los convertimos a datos mensuales
+def bajar_mensual_uno(sym, start, end):
+    try:
+        df = yf.download(sym, start=start, end=end, interval="1d", progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+        if col is None:
+            return None
+        s = df[col].resample("M").last()
+        if s.dropna().empty:
+            return None
+        s.name = sym
+        return s
+    except Exception:
+        return None
+
+# Cargamos acciones
+gainers_df = cargar_simbolos("gainers_symbols.csv")
+symbols = gainers_df["Symbol"].tolist()
+print("Símbolos detectados:", len(symbols))
+
+# Ventana de 12 meses:
+end = date.today()
+start = end - timedelta(days=365)
+
+# Descargamos acción por acción:
+series = {}
+for sym in symbols:
+    s = bajar_mensual_uno(sym, start, end)
+    if s is not None:
+        series[sym] = s
+
+# Consolidamos:
+if series:
+    adj = pd.concat(series.values(), axis=1).sort_index()
+    adj = adj.dropna(axis=1, how="all")
+else:
+    adj = pd.DataFrame()
+
+print("Panel mensual (meses x símbolos):", adj.shape)
+display(adj.tail(6))
+
+# Guardamos la data:
+if not adj.empty:
+    adj.to_csv("monthly_adjclose_1y.csv")
+    print("Guardado:", "monthly_adjclose_1y.csv")
+
+  
+# PARTE 3
+
+
+# Cargamos la base de datos de la parte anterior:
+base_acciones = Path("monthly_adjclose_1y.csv")
+
+adj = pd.read_csv(base_acciones, parse_dates=[0], index_col=0).sort_index()
+if adj.shape[0] > 12:
+    adj = adj.iloc[-12:]
+adj = adj.dropna(axis=1, how="all")
+
+#Partimos la base en 6 meses/6 meses
+first6 = adj.iloc[:6].copy()
+last6  = adj.iloc[-6:].copy()
+
+# Símbolos con datos completos en ambos tramos
+valid_first = first6.dropna(axis=1, how="any")
+valid_last  = last6.dropna(axis=1, how="any")
+comunes = list(set(valid_first.columns) & set(valid_last.columns))
+first6 = first6[comunes]
+last6  = last6[comunes]
+
+# Estrategia: Top 10 por retorno acumulado en los primeros 6 meses
+cumret_first6 = (first6.iloc[-1] / first6.iloc[0] - 1).sort_values(ascending=False)
+n = 10 if len(cumret_first6) >= 10 else len(cumret_first6)
+seleccion = list(cumret_first6.head(n).index)
+
+pd.Series(seleccion, name="SelectedSymbols").to_csv("selected_symbols.csv", index=False)
+print("Seleccionadas:", seleccion)
+
+# Retornos individuales últimos 6 meses
+ret_last6 = last6[seleccion].pct_change().dropna(how="all")
+ret_last6.to_csv("last6_stock_returns.csv")
+
+# Portafolio igual ponderado
+ret_port = ret_last6.mean(axis=1)             # promedio simple = equal-weight
+ret_port_cum = (1 + ret_port).cumprod() - 1
+
+ret_port.to_csv("last6_portfolio_returns.csv")
+
+# Gráficos
+plt.figure(figsize=(8,4))
+ret_port.plot(marker="o")
+plt.title("Retorno mensual del portafolio (últimos 6 meses)")
+plt.ylabel("Retorno")
+plt.xlabel("Mes")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8,4))
+ret_port_cum.plot(marker="o")
+plt.title("Retorno acumulado del portafolio (últimos 6 meses)")
+plt.ylabel("Retorno acumulado")
+plt.xlabel("Mes")
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
